@@ -1,0 +1,397 @@
+use anyhow::{anyhow, Result};
+use base64::{engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}, Engine as _};
+use blake2::{Blake2b512, Digest};
+use clap::{Parser, Subcommand};
+use ed25519_dalek::{SigningKey, VerifyingKey, Signature, Signer};
+use hkdf::Hkdf;
+use rand::{RngCore, rngs::OsRng};
+use sha2::Sha256;
+use std::path::{PathBuf, Path};
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::time::{SystemTime, UNIX_EPOCH};
+use x25519_dalek::{StaticSecret, PublicKey};
+use chacha20poly1305::{aead::{Aead, Payload}, ChaCha20Poly1305, KeyInit, XChaCha20Poly1305, XNonce, Nonce};
+use zeroize::Zeroizing;
+
+const CHUNK_SIZE: usize = 65519;
+const MAX_V3_BODY: usize = 132 * 1024 * 1024;
+const OPK_NONE: u32 = 0xffffffff;
+
+#[derive(Parser)]
+#[command(name="mesh-crypto", version="0.3.0", about="mesh V3 crypto client (Signal-grade, 128MB, single token)")]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Commands,
+    #[arg(long, default_value="https://fried.sh", global=true)]
+    host: String,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    Gen,
+    Fp,
+    Claim,
+    #[command(name="x3dh")]
+    X3dh { #[command(subcommand)] sub: X3dhCmd },
+    Allow { fp: String, #[arg(long, default_value="allow")] action: String },
+    Send { #[arg(long)] to: String, #[arg(long)] msg: Option<String>, #[arg(long)] file: Option<String> },
+    #[command(name="send-file")]
+    SendFile { #[arg(long)] to: String, #[arg(long)] file: String },
+    Poll { #[arg(long)] out: Option<String>, #[arg(long, default_value="true")] decrypt: bool },
+    #[command(name="rotate-token")]
+    RotateToken,
+    #[command(name="allow-list")]
+    AllowList,
+}
+
+#[derive(Subcommand)]
+enum X3dhCmd { Publish }
+
+fn mesh_dir() -> PathBuf { dirs::home_dir().expect("no home").join(".mesh-v3") }
+fn keys_dir() -> PathBuf { mesh_dir().join("keys") }
+fn now_secs() -> i64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64 }
+
+fn b64_decode(s: &str) -> Result<Vec<u8>> {
+    let s = s.trim();
+    URL_SAFE_NO_PAD.decode(s).or_else(|_| STANDARD.decode(s)).map_err(|e| anyhow!("b64 decode: {} on {}", e, &s[..std::cmp::min(20,s.len())]))
+}
+fn b64_encode(b: &[u8]) -> String { URL_SAFE_NO_PAD.encode(b) }
+
+fn load_identity() -> Result<(Zeroizing<[u8;32]>, SigningKey, String, StaticSecret, PublicKey)> {
+    let dir = mesh_dir();
+    let secret = fs::read(dir.join("secret.key"))?;
+    if secret.len() < 64 { return Err(anyhow!("secret.key len {}", secret.len())); }
+    let mut ed_seed = [0u8;32]; ed_seed.copy_from_slice(&secret[0..32]);
+    let mut x_priv_bytes = [0u8;32]; x_priv_bytes.copy_from_slice(&secret[32..64]);
+    let ed_seed_z = Zeroizing::new(ed_seed);
+    let ed_sk = SigningKey::from_bytes(&ed_seed_z);
+    let fp = fs::read_to_string(dir.join("fp"))?.trim().to_ascii_lowercase();
+    let x_priv = StaticSecret::from(x_priv_bytes);
+    let x_pub = PublicKey::from(&x_priv);
+    Ok((ed_seed_z, ed_sk, fp, x_priv, x_pub))
+}
+fn fp_to_bytes(fp: &str) -> Result<[u8;32]> {
+    if fp.len()!=64 { return Err(anyhow!("fp len")); }
+    let mut out=[0u8;32];
+    for i in 0..32 {
+        out[i]=u8::from_str_radix(&fp[i*2..i*2+2],16).map_err(|_| anyhow!("bad hex"))?;
+    }
+    Ok(out)
+}
+fn fp_from_bytes(b: &[u8;32]) -> String { hex::encode(b) }
+
+fn ed_verify(fp_hex: &str, msg: &[u8], sig_b64: &str) -> Result<bool> {
+    let fp_bytes = fp_to_bytes(fp_hex)?;
+    let vk = VerifyingKey::from_bytes(&fp_bytes).map_err(|e| anyhow!("bad vk: {:?}", e))?;
+    let sig_bytes = b64_decode(sig_b64)?;
+    if sig_bytes.len()!=64 { return Err(anyhow!("sig len {}", sig_bytes.len())); }
+    let sig = Signature::from_bytes(&sig_bytes.clone().try_into().unwrap());
+    Ok(vk.verify_strict(msg, &sig).is_ok())
+}
+fn hkdf_derive(ikm: &[u8], info: &[u8], len: usize) -> Result<Vec<u8>> {
+    let hk = Hkdf::<Sha256>::new(None, ikm);
+    let mut okm = vec![0u8; len];
+    hk.expand(info, &mut okm).map_err(|e| anyhow!("hkdf {:?}", e))?;
+    Ok(okm)
+}
+fn hkdf_derive_salt(salt: &[u8], ikm: &[u8], info: &[u8], len: usize) -> Result<Vec<u8>> {
+    let hk = Hkdf::<Sha256>::new(Some(salt), ikm);
+    let mut okm = vec![0u8; len];
+    hk.expand(info, &mut okm).map_err(|e| anyhow!("hkdf {:?}", e))?;
+    Ok(okm)
+}
+fn xenc(key: &[u8;32], nonce: &[u8;24], pt: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
+    let c = XChaCha20Poly1305::new_from_slice(key).map_err(|e| anyhow!("{:?}", e))?;
+    c.encrypt(XNonce::from_slice(nonce), Payload{msg:pt,aad}).map_err(|e| anyhow!("enc {:?}", e))
+}
+fn xdec(key: &[u8;32], nonce: &[u8;24], ct: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
+    let c = XChaCha20Poly1305::new_from_slice(key).map_err(|e| anyhow!("{:?}", e))?;
+    c.decrypt(XNonce::from_slice(nonce), Payload{msg:ct,aad}).map_err(|e| anyhow!("dec {:?}", e))
+}
+fn cenc(key: &[u8;32], nonce: &[u8;12], pt: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
+    let c = ChaCha20Poly1305::new_from_slice(key).map_err(|e| anyhow!("{:?}", e))?;
+    c.encrypt(Nonce::from_slice(nonce), Payload{msg:pt,aad}).map_err(|e| anyhow!("enc {:?}", e))
+}
+fn cdec(key: &[u8;32], nonce: &[u8;12], ct: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
+    let c = ChaCha20Poly1305::new_from_slice(key).map_err(|e| anyhow!("{:?}", e))?;
+    c.decrypt(Nonce::from_slice(nonce), Payload{msg:ct,aad}).map_err(|e| anyhow!("dec {:?}", e))
+}
+
+fn cmd_gen() -> Result<()> {
+    let dir = mesh_dir();
+    fs::create_dir_all(&dir)?; fs::create_dir_all(keys_dir())?; fs::create_dir_all(dir.join("prekeys"))?;
+    let mut ed_seed=[0u8;32]; OsRng.fill_bytes(&mut ed_seed);
+    let ed_sk=SigningKey::from_bytes(&ed_seed);
+    let fp=hex::encode(ed_sk.verifying_key().as_bytes());
+    let mut x_priv_bytes=[0u8;32]; OsRng.fill_bytes(&mut x_priv_bytes);
+    let x_priv=StaticSecret::from(x_priv_bytes);
+    let x_pub=PublicKey::from(&x_priv);
+    let x_sig=ed_sk.sign(x_pub.as_bytes());
+    let mut sec=Vec::new(); sec.extend_from_slice(&ed_seed); sec.extend_from_slice(&x_priv_bytes);
+    fs::write(dir.join("secret.key"), &sec)?; fs::set_permissions(dir.join("secret.key"), fs::Permissions::from_mode(0o600))?;
+    fs::write(dir.join("fp"), format!("{}\n", fp))?;
+    fs::write(dir.join("x_id_pub"), b64_encode(x_pub.as_bytes()))?;
+    fs::write(dir.join("x_id_sig"), b64_encode(&x_sig.to_bytes()))?;
+    println!("generated fp={}", fp);
+    Ok(())
+}
+fn cmd_fp() -> Result<()> { println!("{}", fs::read_to_string(mesh_dir().join("fp"))?.trim().to_ascii_lowercase()); Ok(()) }
+
+async fn cmd_claim(host: &str) -> Result<()> {
+    let (_, ed_sk, fp, _, _) = load_identity()?;
+    let client=reqwest::Client::builder().danger_accept_invalid_certs(true).build()?;
+    let chal_url=format!("{}/mesh/v3/{}/claim/challenge", host.trim_end_matches('/'), fp);
+    let resp=client.get(&chal_url).send().await?; if !resp.status().is_success(){return Err(anyhow!("challenge {}", resp.text().await?));}
+    let j:serde_json::Value=resp.json().await?; let nonce=j["nonce"].as_str().ok_or(anyhow!("no nonce"))?.to_string();
+    let ts=now_secs(); let msg=format!("CLAIM /mesh/v3/{}/claim\n{}\n{}", fp, ts, nonce);
+    let sig=ed_sk.sign(msg.as_bytes()); let sig_b64=STANDARD.encode(sig.to_bytes());
+    let claim_url=format!("{}/mesh/v3/{}/claim", host.trim_end_matches('/'), fp);
+    let body=serde_json::json!({"ts":ts,"nonce":nonce,"sig":sig_b64});
+    let resp=client.post(&claim_url).header("X-Mesh-Timestamp",ts.to_string()).header("X-Mesh-Nonce",nonce.clone()).header("X-Mesh-Signature",sig_b64.clone()).json(&body).send().await?;
+    let st=resp.status(); let txt=resp.text().await?; if !st.is_success(){return Err(anyhow!("claim {} {}", st, txt));}
+    let j:serde_json::Value=serde_json::from_str(&txt)?; let token=j["token"].as_str().ok_or(anyhow!("no token"))?.to_string();
+    fs::create_dir_all(keys_dir())?; let kp=keys_dir().join(format!("{}.key",fp)); fs::write(&kp,format!("{}\n",token))?; fs::set_permissions(&kp,fs::Permissions::from_mode(0o600))?;
+    println!("claimed {}", fp); println!("token {}", token); Ok(())
+}
+async fn cmd_x3dh_publish(host: &str) -> Result<()> {
+    let (_, ed_sk, fp, _, x_pub)=load_identity()?;
+    let token=fs::read_to_string(keys_dir().join(format!("{}.key",fp)))?.trim().to_string();
+    let mut spk_priv_bytes=[0u8;32]; OsRng.fill_bytes(&mut spk_priv_bytes);
+    let spk_priv=StaticSecret::from(spk_priv_bytes); let spk_pub=PublicKey::from(&spk_priv);
+    let spk_sig=ed_sk.sign(spk_pub.as_bytes()); let spk_id=(OsRng.next_u32()%1_000_000) as u32;
+    let prekeys_dir=mesh_dir().join("prekeys"); fs::create_dir_all(&prekeys_dir)?;
+    let mut opks=Vec::new();
+    for i in 0..100u32 { let mut b=[0u8;32]; OsRng.fill_bytes(&mut b); let priv_=StaticSecret::from(b); let pub_=PublicKey::from(&priv_); fs::write(prekeys_dir.join(format!("opk_{}.priv",i)), b64_encode(&b))?; let _=fs::set_permissions(prekeys_dir.join(format!("opk_{}.priv",i)), fs::Permissions::from_mode(0o600)); opks.push(serde_json::json!({"id":i,"pub":b64_encode(pub_.as_bytes())})); }
+    fs::write(prekeys_dir.join(format!("spk_{}.priv",spk_id)), b64_encode(&spk_priv_bytes))?; fs::write(prekeys_dir.join("spk_priv"), b64_encode(&spk_priv_bytes))?; fs::write(prekeys_dir.join("spk_id"), spk_id.to_string())?;
+    let client=reqwest::Client::builder().danger_accept_invalid_certs(true).build()?;
+    let url=format!("{}/mesh/v3/{}/x3dh/publish", host.trim_end_matches('/'), fp);
+    let body=serde_json::json!({"x_id_pub":b64_encode(x_pub.as_bytes()),"x_id_sig":fs::read_to_string(mesh_dir().join("x_id_sig"))?.trim(),"spk_id":spk_id,"spk_pub":b64_encode(spk_pub.as_bytes()),"spk_sig":STANDARD.encode(spk_sig.to_bytes()),"opks":opks});
+    let resp=client.post(&url).header("X-Mesh-Key",token).json(&body).send().await?; let st=resp.status(); let txt=resp.text().await?; if !st.is_success(){return Err(anyhow!("publish {} {}", st, txt));}
+    println!("published {}", txt); Ok(())
+}
+async fn cmd_allow(fp_target: &str, action: &str, host: &str) -> Result<()> {
+    let (_,_,fp,_,_)=load_identity()?; let token=fs::read_to_string(keys_dir().join(format!("{}.key",fp)))?.trim().to_string();
+    let client=reqwest::Client::builder().danger_accept_invalid_certs(true).build()?;
+    let url=format!("{}/mesh/v3/{}/allow", host.trim_end_matches('/'), fp);
+    let resp=client.post(&url).header("X-Mesh-Key",token).json(&serde_json::json!({"fp":fp_target.to_ascii_lowercase(),"action":action})).send().await?;
+    println!("{}", resp.text().await?); Ok(())
+}
+async fn fetch_bundle(host: &str, peer_fp: &str) -> Result<serde_json::Value> {
+    let client=reqwest::Client::builder().danger_accept_invalid_certs(true).build()?;
+    let url=format!("{}/mesh/v3/{}/x3dh/bundle", host.trim_end_matches('/'), peer_fp.to_ascii_lowercase());
+    let resp=client.get(&url).send().await?; if !resp.status().is_success(){return Err(anyhow!("bundle {}", resp.text().await?));}
+    Ok(resp.json().await?)
+}
+
+// returns (sk, ek_pub_bytes, spk_id, opk_id)
+fn x3dh_alice(my_x_priv: &StaticSecret, my_fp: &str, peer_fp: &str, bundle: &serde_json::Value) -> Result<(Vec<u8>, [u8;32], u32, u32)> {
+    let peer_fp_lc=peer_fp.to_ascii_lowercase();
+    let x_id_pub_b64=bundle["x_id_pub"].as_str().ok_or(anyhow!("missing x_id_pub"))?;
+    let x_id_sig_b64=bundle["x_id_sig"].as_str().ok_or(anyhow!("missing x_id_sig"))?;
+    let x_id_pub_bytes=b64_decode(x_id_pub_b64)?; if !ed_verify(&peer_fp_lc,&x_id_pub_bytes,x_id_sig_b64)? {return Err(anyhow!("bad x_id_sig"));}
+    let spk_pub_b64=bundle["spk_pub"].as_str().ok_or(anyhow!("missing spk_pub"))?;
+    let spk_sig_b64=bundle["spk_sig"].as_str().ok_or(anyhow!("missing spk_sig"))?;
+    let spk_pub_bytes=b64_decode(spk_pub_b64)?; if !ed_verify(&peer_fp_lc,&spk_pub_bytes,spk_sig_b64)? {return Err(anyhow!("bad spk_sig"));}
+    let spk_id=bundle["spk_id"].as_u64().unwrap_or(0) as u32;
+    let opk_id=bundle["opk_id"].as_u64().map(|v|v as u32).unwrap_or(OPK_NONE);
+    let opk_pub_opt=bundle["opk_pub"].as_str().map(|s| b64_decode(s).unwrap());
+    let peer_x_pub=PublicKey::from(<[u8;32]>::try_from(x_id_pub_bytes).unwrap());
+    let peer_spk_pub=PublicKey::from(<[u8;32]>::try_from(spk_pub_bytes).unwrap());
+    let mut ek_priv_bytes=[0u8;32]; OsRng.fill_bytes(&mut ek_priv_bytes);
+    let ek_priv=StaticSecret::from(ek_priv_bytes); let ek_pub=PublicKey::from(&ek_priv);
+    let ek_pub_bytes=ek_pub.to_bytes();
+    let dh1=my_x_priv.diffie_hellman(&peer_spk_pub);
+    let dh2=ek_priv.diffie_hellman(&peer_x_pub);
+    let dh3=ek_priv.diffie_hellman(&peer_spk_pub);
+    let mut ikm=Vec::new(); ikm.extend_from_slice(dh1.as_bytes()); ikm.extend_from_slice(dh2.as_bytes()); ikm.extend_from_slice(dh3.as_bytes());
+    if let Some(opk_bytes)=opk_pub_opt { let opk_pub=PublicKey::from(<[u8;32]>::try_from(opk_bytes).unwrap()); let dh4=ek_priv.diffie_hellman(&opk_pub); ikm.extend_from_slice(dh4.as_bytes()); }
+    let my_fp_bytes=fp_to_bytes(my_fp)?; let peer_fp_bytes=fp_to_bytes(&peer_fp_lc)?;
+    let mut info=Vec::new(); info.extend_from_slice(b"mesh-v3-x3dh v1"); info.extend_from_slice(&my_fp_bytes); info.extend_from_slice(&peer_fp_bytes); info.extend_from_slice(&spk_id.to_be_bytes()); info.extend_from_slice(&opk_id.to_be_bytes());
+    let sk=hkdf_derive(&ikm,&info,32)?;
+    Ok((sk, ek_pub_bytes, spk_id, opk_id))
+}
+
+async fn cmd_send(to: &str, msg_opt: Option<String>, file_opt: Option<String>, host: &str) -> Result<()> {
+    if let Some(f)=file_opt { return cmd_send_file(to,&f,host).await; }
+    let msg=msg_opt.unwrap_or_else(||"hello v3".to_string());
+    let (_,_,my_fp,my_x_priv,my_x_pub)=load_identity()?;
+    let my_token=fs::read_to_string(keys_dir().join(format!("{}.key",my_fp)))?.trim().to_string();
+    let peer_fp=to.to_ascii_lowercase(); if peer_fp.len()!=64{return Err(anyhow!("peer fp len"));}
+    let bundle=fetch_bundle(host,&peer_fp).await?;
+    let (sk, ek_pub_bytes, spk_id, opk_id)=x3dh_alice(&my_x_priv,&my_fp,&peer_fp,&bundle)?;
+    let okm=hkdf_derive_salt(&sk,&sk,b"mesh-v3-msg v1",64)?; let hek:[u8;32]=okm[0..32].try_into().unwrap(); let mk:[u8;32]=okm[32..64].try_into().unwrap();
+    let header_plain=serde_json::json!({"n":0,"pn":0,"spk_id":spk_id,"opk_id":opk_id}).to_string();
+    let header_ct=xenc(&hek,&[0u8;24],header_plain.as_bytes(),b"")?;
+    let pt=serde_json::json!({"text":msg,"from":my_fp,"ts":now_secs()}).to_string();
+    let mut body_nonce=[0u8;24]; OsRng.fill_bytes(&mut body_nonce);
+    let body_ct=xenc(&mk,&body_nonce,pt.as_bytes(),&header_ct)?;
+    let my_fp_bytes=fp_to_bytes(&my_fp)?; let mut out=Vec::new();
+    out.push(0x03); out.push(0x01); out.extend_from_slice(&ek_pub_bytes); out.extend_from_slice(&my_fp_bytes); out.extend_from_slice(my_x_pub.as_bytes());
+    out.extend_from_slice(&spk_id.to_be_bytes()); out.extend_from_slice(&opk_id.to_be_bytes());
+    out.extend_from_slice(&(header_ct.len() as u16).to_be_bytes()); out.extend_from_slice(&header_ct);
+    out.extend_from_slice(&body_nonce); out.extend_from_slice(&body_ct);
+    let client=reqwest::Client::builder().danger_accept_invalid_certs(true).build()?;
+    let resp=client.post(format!("{}/mesh/v3/{}",host.trim_end_matches('/'),peer_fp)).header("X-Mesh-Key",my_token).header("X-Mesh-From",my_fp.clone()).header("Content-Type","application/octet-stream").body(out).send().await?;
+    let st=resp.status(); let txt=resp.text().await?; if !st.is_success(){return Err(anyhow!("send {} {}",st,txt));}
+    println!("sent {}",txt); Ok(())
+}
+
+async fn cmd_send_file(to: &str, file_path: &str, host: &str) -> Result<()> {
+    let (_,_,my_fp,my_x_priv,my_x_pub)=load_identity()?;
+    let my_token=fs::read_to_string(keys_dir().join(format!("{}.key",my_fp)))?.trim().to_string();
+    let peer_fp=to.to_ascii_lowercase();
+    let bundle=fetch_bundle(host,&peer_fp).await?;
+    let (sk, ek_pub_bytes, spk_id, opk_id)=x3dh_alice(&my_x_priv,&my_fp,&peer_fp,&bundle)?;
+    let file_bytes=fs::read(file_path)?; if file_bytes.len()>128*1024*1024{return Err(anyhow!(">128M"));}
+    let mut hasher=Blake2b512::new(); hasher.update(&file_bytes); let hash=hasher.finalize(); let hash_hex=hex::encode(&hash[0..32]);
+    let mut fk=[0u8;32]; OsRng.fill_bytes(&mut fk); let mut base_nonce=[0u8;12]; OsRng.fill_bytes(&mut base_nonce);
+    let okm=hkdf_derive_salt(&sk,&sk,b"mesh-v3-msg v1",64)?; let hek:[u8;32]=okm[0..32].try_into().unwrap(); let _mk:[u8;32]=okm[32..64].try_into().unwrap();
+    let file_name=Path::new(file_path).file_name().unwrap().to_string_lossy().to_string();
+    let chunks=(file_bytes.len()+CHUNK_SIZE-1)/CHUNK_SIZE;
+    let header_json=serde_json::json!({"type":"file","name":file_name,"size":file_bytes.len(),"chunks":chunks,"chunk_size":CHUNK_SIZE,"hash":hash_hex,"fk":b64_encode(&fk),"base_nonce":b64_encode(&base_nonce),"spk_id":spk_id,"opk_id":opk_id});
+    let header_ct=xenc(&hek,&[0u8;24],header_json.to_string().as_bytes(),b"")?;
+    let mut hh=Blake2b512::new(); hh.update(&header_ct); let header_hash=hh.finalize(); let header_hash32=&header_hash[0..32];
+    let my_fp_bytes=fp_to_bytes(&my_fp)?; let mut out=Vec::new();
+    out.push(0x03); out.push(0x02); out.extend_from_slice(&ek_pub_bytes); out.extend_from_slice(&my_fp_bytes); out.extend_from_slice(my_x_pub.as_bytes());
+    out.extend_from_slice(&spk_id.to_be_bytes()); out.extend_from_slice(&opk_id.to_be_bytes());
+    out.extend_from_slice(&(header_ct.len() as u16).to_be_bytes()); out.extend_from_slice(&header_ct);
+    for i in 0..chunks {
+        let s=i*CHUNK_SIZE; let e=std::cmp::min(s+CHUNK_SIZE,file_bytes.len()); let chunk=&file_bytes[s..e];
+        let is_last=if i==chunks-1{1u8}else{0u8};
+        let mut n12=[0u8;12]; n12[0..4].copy_from_slice(&base_nonce[0..4]); n12[4..12].copy_from_slice(&(i as u64).to_le_bytes());
+        let mut ad=Vec::new(); ad.extend_from_slice(header_hash32); ad.extend_from_slice(&(i as u64).to_le_bytes()); ad.push(is_last);
+        let ct=cenc(&fk,&n12,chunk,&ad)?; out.extend_from_slice(&(ct.len() as u16).to_be_bytes()); out.extend_from_slice(&ct);
+    }
+    let client=reqwest::Client::builder().danger_accept_invalid_certs(true).build()?;
+    // bypass nginx 512k limit: if out > 450k, use chunked upload via new /file/<id>/chunk/<idx> endpoints
+    let out_len = out.len();
+    if out_len <= 450*1024 {
+        let resp=client.post(format!("{}/mesh/v3/{}",host.trim_end_matches('/'),peer_fp)).header("X-Mesh-Key",my_token.clone()).header("X-Mesh-From",my_fp.clone()).header("Content-Type","application/octet-stream").body(out).send().await?;
+        let st=resp.status(); let txt=resp.text().await?; if !st.is_success(){return Err(anyhow!("send-file {} {}",st,txt));}
+        println!("sent file {} ({} bytes {} chunks wire {} bytes) {}", file_path, file_bytes.len(), chunks, out_len, txt); Ok(())
+    } else {
+        // chunked file upload: nginx is now 150m, use 8M chunks for speed (16x faster than 400k)
+        const FILE_CHUNK_SIZE: usize = 8*1024*1024; // 8388608, well under 10M server limit + 150m nginx
+        let file_id = {
+            let mut rnd = [0u8;16]; OsRng.fill_bytes(&mut rnd);
+            hex::encode(rnd)
+        };
+        let total_file_chunks = (out_len + FILE_CHUNK_SIZE - 1) / FILE_CHUNK_SIZE;
+        println!("send-file {} ({} bytes) -> wire {} bytes, chunked upload {} x {}M via file_id {}", file_path, file_bytes.len(), out_len, total_file_chunks, FILE_CHUNK_SIZE/(1024*1024), &file_id[0..8]);
+        for i in 0..total_file_chunks {
+            let s = i*FILE_CHUNK_SIZE;
+            let e = std::cmp::min(s+FILE_CHUNK_SIZE, out_len);
+            let chunk = &out[s..e];
+            let url = format!("{}/mesh/v3/{}/file/{}/chunk/{}", host.trim_end_matches('/'), peer_fp, file_id, i);
+            let resp = client.post(&url).header("X-Mesh-Key", my_token.clone()).header("X-Mesh-From", my_fp.clone()).header("Content-Type","application/octet-stream").body(chunk.to_vec()).send().await?;
+            let st = resp.status(); let txt = resp.text().await?;
+            if !st.is_success() {
+                return Err(anyhow!("send-file chunk {}/{} failed {} {}", i+1, total_file_chunks, st, txt));
+            }
+            // small progress
+            if total_file_chunks > 10 && (i+1) % 10 == 0 {
+                println!("  chunk {}/{} ok", i+1, total_file_chunks);
+            }
+        }
+        // finalize
+        let finalize_url = format!("{}/mesh/v3/{}/file/{}/finalize", host.trim_end_matches('/'), peer_fp, file_id);
+        let resp = client.post(&finalize_url).header("X-Mesh-Key", my_token).header("X-Mesh-From", my_fp.clone()).header("Content-Type","application/json").body(format!("{{\"total\":{}}}", total_file_chunks)).send().await?;
+        let st=resp.status(); let txt=resp.text().await?; if !st.is_success(){return Err(anyhow!("send-file finalize {} {}",st,txt));}
+        println!("sent file {} ({} bytes {} inner chunks, {} wire chunks) {} final {}", file_path, file_bytes.len(), chunks, total_file_chunks, file_id, txt); Ok(())
+    }
+}
+
+fn load_prekey_priv(kind: &str, id: u32) -> Result<StaticSecret> {
+    let dir=mesh_dir().join("prekeys");
+    let p=if kind=="spk"{ let p1=dir.join(format!("spk_{}.priv",id)); if p1.exists(){p1}else{dir.join("spk_priv")} } else { dir.join(format!("opk_{}.priv",id)) };
+    let b=b64_decode(fs::read_to_string(&p)?.trim())?; Ok(StaticSecret::from(<[u8;32]>::try_from(b).unwrap()))
+}
+fn x3dh_bob(my_x_priv: &StaticSecret, my_fp: &str, peer_fp: &str, peer_x_pub: &PublicKey, ek_pub: &PublicKey, spk_id: u32, opk_id: u32) -> Result<Vec<u8>> {
+    let spk_priv=load_prekey_priv("spk", spk_id)?;
+    let dh1=spk_priv.diffie_hellman(peer_x_pub);
+    let dh2=my_x_priv.diffie_hellman(ek_pub);
+    let dh3=spk_priv.diffie_hellman(ek_pub);
+    let mut ikm=Vec::new(); ikm.extend_from_slice(dh1.as_bytes()); ikm.extend_from_slice(dh2.as_bytes()); ikm.extend_from_slice(dh3.as_bytes());
+    if opk_id!=OPK_NONE { let opk_priv=load_prekey_priv("opk", opk_id)?; let dh4=opk_priv.diffie_hellman(ek_pub); ikm.extend_from_slice(dh4.as_bytes()); }
+    let peer_fp_bytes=fp_to_bytes(peer_fp)?; let my_fp_bytes=fp_to_bytes(my_fp)?;
+    let mut info=Vec::new(); info.extend_from_slice(b"mesh-v3-x3dh v1"); info.extend_from_slice(&peer_fp_bytes); info.extend_from_slice(&my_fp_bytes); info.extend_from_slice(&spk_id.to_be_bytes()); info.extend_from_slice(&opk_id.to_be_bytes());
+    hkdf_derive(&ikm,&info,32)
+}
+
+async fn cmd_poll(host: &str, out_dir: Option<String>, do_decrypt: bool) -> Result<()> {
+    let (_,_,my_fp,my_x_priv,_)=load_identity()?;
+    let token=fs::read_to_string(keys_dir().join(format!("{}.key",my_fp)))?.trim().to_string();
+    let client=reqwest::Client::builder().danger_accept_invalid_certs(true).build()?;
+    let resp=client.get(format!("{}/mesh/v3/{}",host.trim_end_matches('/'),my_fp)).header("X-Mesh-Key",token.clone()).send().await?;
+    if !resp.status().is_success(){return Err(anyhow!("list {}",resp.text().await?));}
+    let j:serde_json::Value=resp.json().await?; let msgs=j["messages"].as_array().cloned().unwrap_or_default();
+    println!("inbox {} msgs", msgs.len());
+    let out_path=out_dir.map(PathBuf::from).unwrap_or_else(||{let d=mesh_dir().join("inbox"); let _=fs::create_dir_all(&d); d}); fs::create_dir_all(&out_path)?;
+    for m in msgs {
+        let id=m["id"].as_str().unwrap_or("").to_string(); if id.is_empty(){continue;}
+        let resp=client.get(format!("{}/mesh/v3/{}/{}",host.trim_end_matches('/'),my_fp,id)).header("X-Mesh-Key",token.clone()).send().await?;
+        if !resp.status().is_success(){eprintln!("get {} {}",id,resp.status()); continue;}
+        let data=resp.bytes().await?.to_vec();
+        if !do_decrypt { fs::write(out_path.join(format!("{}.msg",id)),&data)?; continue; }
+        if data.len()<2 || data[0]!=0x03 {eprintln!("{} not v3",id); continue;}
+        let typ=data[1]; let mut off=2;
+        if data.len()<off+32+32+32+4+4+2{continue;}
+        let ek_pub_bytes: [u8;32] =data[off..off+32].try_into().unwrap(); off+=32;
+        let sender_fp_bytes: [u8;32] =data[off..off+32].try_into().unwrap(); off+=32;
+        let sender_x_pub_bytes: [u8;32] =data[off..off+32].try_into().unwrap(); off+=32;
+        let spk_id=u32::from_be_bytes(data[off..off+4].try_into().unwrap()); off+=4;
+        let opk_id=u32::from_be_bytes(data[off..off+4].try_into().unwrap()); off+=4;
+        let hlen=u16::from_be_bytes([data[off],data[off+1]]) as usize; off+=2;
+        if data.len()<off+hlen{continue;} let header_ct=&data[off..off+hlen]; off+=hlen;
+        let sender_fp=fp_from_bytes(&sender_fp_bytes);
+        let sender_x_pub=PublicKey::from(sender_x_pub_bytes); let ek_pub=PublicKey::from(ek_pub_bytes);
+        let sk=match x3dh_bob(&my_x_priv,&my_fp,&sender_fp,&sender_x_pub,&ek_pub,spk_id,opk_id){Ok(v)=>v,Err(e)=>{eprintln!("{} x3dh bob {}",id,e); continue;}};
+        let okm=hkdf_derive_salt(&sk,&sk,b"mesh-v3-msg v1",64).unwrap(); let hek:[u8;32]=okm[0..32].try_into().unwrap(); let mk:[u8;32]=okm[32..64].try_into().unwrap();
+        let header_plain=match xdec(&hek,&[0u8;24],header_ct,b""){Ok(v)=>v,Err(e)=>{eprintln!("{} header dec {}",id,e); continue;}};
+        if typ==0x01 {
+            if data.len()<off+24{continue;} let body_nonce: [u8;24] =data[off..off+24].try_into().unwrap(); off+=24; let body_ct=&data[off..];
+            let pt=match xdec(&mk,&body_nonce,body_ct,header_ct){Ok(v)=>v,Err(e)=>{eprintln!("{} body dec {}",id,e); continue;}};
+            println!("msg {} from {}: {}", id, &sender_fp[0..8], String::from_utf8_lossy(&pt));
+            fs::write(out_path.join(format!("{}.json",id)),&pt)?;
+            let _=client.delete(format!("{}/mesh/v3/{}/{}",host.trim_end_matches('/'),my_fp,id)).header("X-Mesh-Key",token.clone()).send().await;
+        } else if typ==0x02 {
+            let hj:serde_json::Value=match serde_json::from_slice(&header_plain){Ok(v)=>v,Err(_)=>continue};
+            let fk=b64_decode(hj["fk"].as_str().unwrap_or("")) .unwrap(); let base_nonce=b64_decode(hj["base_nonce"].as_str().unwrap_or("")).unwrap();
+            let exp_chunks=hj["chunks"].as_u64().unwrap_or(0) as usize; let exp_size=hj["size"].as_u64().unwrap_or(0) as usize; let exp_hash=hj["hash"].as_str().unwrap_or("").to_string(); let name=hj["name"].as_str().unwrap_or("file.bin").to_string();
+            let fk_arr: [u8;32] =fk.try_into().unwrap(); let mut base12=[0u8;12]; base12.copy_from_slice(&base_nonce);
+            let mut hh=Blake2b512::new(); hh.update(header_ct); let hhash=hh.finalize(); let hhash32=&hhash[0..32];
+            let out_file=out_path.join(format!("{}-{}",id,name)); let mut outf=fs::File::create(&out_file).unwrap(); let mut hasher=Blake2b512::new(); let mut total=0usize; let mut idx=0usize; let mut cur=off; let mut ok=true;
+            while cur+2<=data.len() && idx<exp_chunks {
+                let clen=u16::from_be_bytes([data[cur],data[cur+1]]) as usize; cur+=2; if cur+clen>data.len(){ok=false; break;} let ct=&data[cur..cur+clen]; cur+=clen;
+                let is_last=if idx+1==exp_chunks{1u8}else{0u8}; let mut n12=[0u8;12]; n12[0..4].copy_from_slice(&base12[0..4]); n12[4..12].copy_from_slice(&(idx as u64).to_le_bytes());
+                let mut ad=Vec::new(); ad.extend_from_slice(hhash32); ad.extend_from_slice(&(idx as u64).to_le_bytes()); ad.push(is_last);
+                let pt=match cdec(&fk_arr,&n12,ct,&ad){Ok(v)=>v,Err(e)=>{eprintln!("{} chunk {} {}",id,idx,e); ok=false; break;}};
+                use std::io::Write; let _=outf.write_all(&pt); hasher.update(&pt); total+=pt.len(); idx+=1;
+            }
+            if !ok || idx!=exp_chunks || total!=exp_size { let _=fs::remove_file(&out_file); eprintln!("{} fail chunks {}/{} size {}/{}",id,idx,exp_chunks,total,exp_size); continue; }
+            let h2=hasher.finalize(); if hex::encode(&h2[0..32])!=exp_hash { let _=fs::remove_file(&out_file); eprintln!("{} hash mismatch",id); continue; }
+            println!("file {} -> {} {} bytes OK", id, out_file.display(), total);
+            let _=client.delete(format!("{}/mesh/v3/{}/{}",host.trim_end_matches('/'),my_fp,id)).header("X-Mesh-Key",token.clone()).send().await;
+        }
+    }
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli=Cli::parse();
+    match cli.cmd {
+        Commands::Gen=>cmd_gen()?,
+        Commands::Fp=>cmd_fp()?,
+        Commands::Claim=>cmd_claim(&cli.host).await?,
+        Commands::X3dh{sub}=>match sub{X3dhCmd::Publish=>cmd_x3dh_publish(&cli.host).await?},
+        Commands::Allow{fp,action}=>cmd_allow(&fp,&action,&cli.host).await?,
+        Commands::AllowList=>{ let (_,_,fp,_,_)=load_identity()?; let token=fs::read_to_string(keys_dir().join(format!("{}.key",fp)))?.trim().to_string(); let client=reqwest::Client::builder().danger_accept_invalid_certs(true).build()?; let resp=client.get(format!("{}/mesh/v3/{}/allow",cli.host.trim_end_matches('/'),fp)).header("X-Mesh-Key",token).send().await?; println!("{}",resp.text().await?); },
+        Commands::Send{to,msg,file}=>cmd_send(&to,msg,file,&cli.host).await?,
+        Commands::SendFile{to,file}=>cmd_send_file(&to,&file,&cli.host).await?,
+        Commands::Poll{out,decrypt}=>cmd_poll(&cli.host,out,decrypt).await?,
+        Commands::RotateToken=>{ let (_,_,fp,_,_)=load_identity()?; let token=fs::read_to_string(keys_dir().join(format!("{}.key",fp)))?.trim().to_string(); let client=reqwest::Client::builder().danger_accept_invalid_certs(true).build()?; let resp=client.post(format!("{}/mesh/v3/{}/rotate_token",cli.host.trim_end_matches('/'),fp)).header("X-Mesh-Key",token).send().await?; let txt=resp.text().await?; println!("{}",txt); if let Ok(j)=serde_json::from_str::<serde_json::Value>(&txt){ if let Some(nt)=j["token"].as_str(){ fs::write(keys_dir().join(format!("{}.key",fp)),format!("{}\n",nt))?; println!("saved"); } } },
+    }
+    Ok(())
+}

@@ -1,0 +1,25 @@
+[package]
+name = "mesh-crypto"
+version = "0.3.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+hex = "0.4"
+rand = { version = "0.8", features = ["std_rng"] }
+ed25519-dalek = "2"
+x25519-dalek = { version = "2", features = ["static_secrets", "reusable_secrets"] }
+hkdf = "0.12"
+hmac = "0.12"
+sha2 = "0.10"
+blake2 = "0.10"
+chacha20poly1305 = "0.10"
+zeroize = { version = "1", features = ["zeroize_derive"] }
+subtle = "2"
+dirs = "5"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls-webpki-roots"], default-features = false }
+anyhow = "1"
