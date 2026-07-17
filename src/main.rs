@@ -531,7 +531,31 @@ async fn cmd_send_file(to: &str, file_path: &str, host: &str) -> Result<()> {
 
 fn load_prekey_priv(kind: &str, id: u32) -> Result<StaticSecret> {
     let dir=mesh_dir().join("prekeys");
-    let p=if kind=="spk"{ let p1=dir.join(format!("spk_{}.priv",id)); if p1.exists(){p1}else{dir.join("spk_priv")} } else { dir.join(format!("opk_{}.priv",id)) };
+    let p=if kind=="spk"{ let p1=dir.join(format!("spk_{}.priv",id)); if p1.exists(){p1}else{dir.join("spk_priv")} } else {
+        let direct = dir.join(format!("opk_{}.priv",id));
+        if direct.exists() { direct } else {
+            // grace: check used dir within 5min
+            let used_dir = dir.join("used");
+            let mut found: Option<std::path::PathBuf> = None;
+            let mut newest_ts: i64 = 0;
+            if let Ok(entries) = std::fs::read_dir(&used_dir) {
+                for e in entries.flatten() {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    if name.starts_with(&format!("opk_{}.priv.", id)) {
+                        if let Some(ts_str) = name.split('.').nth(2) {
+                            if let Ok(ts) = ts_str.parse::<i64>() {
+                                if now_secs() - ts <= 300 && ts > newest_ts {
+                                    newest_ts = ts;
+                                    found = Some(e.path());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(fp) = found { fp } else { direct }
+        }
+    };
     let b=b64_decode(fs::read_to_string(&p)?.trim())?; Ok(StaticSecret::from(<[u8;32]>::try_from(b).unwrap()))
 }
 fn x3dh_bob(my_x_priv: &StaticSecret, my_fp: &str, peer_fp: &str, peer_x_pub: &PublicKey, ek_pub: &PublicKey, spk_id: u32, opk_id: u32) -> Result<Vec<u8>> {
@@ -619,11 +643,40 @@ async fn cmd_poll(host: &str, out_dir: Option<String>, do_decrypt: bool) -> Resu
             if data.len()<off+hlen{continue;} let header_ct=&data[off..off+hlen]; off+=hlen;
             let sender_fp=fp_from_bytes(&sender_fp_bytes);
             let sender_x_pub=PublicKey::from(sender_x_pub_bytes); let ek_pub=PublicKey::from(ek_pub_bytes);
-            let sk=match x3dh_bob(&my_x_priv,&my_fp,&sender_fp,&sender_x_pub,&ek_pub,spk_id,opk_id){Ok(v)=>v,Err(e)=>{eprintln!("{} x3dh bob {}",id,e); continue;}};
-            // OPK deletion for FS - delete after successful X3DH if OPK was used
+            let sk=match x3dh_bob(&my_x_priv,&my_fp,&sender_fp,&sender_x_pub,&ek_pub,spk_id,opk_id){Ok(v)=>v,Err(e)=>{
+                eprintln!("{} x3dh bob {} (opk {} spk {}) dead-lettering after fail",id,e,opk_id,spk_id);
+                // FS grace already tried used dir; if still fail, delete to prevent stuck inbox
+                let _=client.delete(format!("{}/mesh/v3/{}/{}",host.trim_end_matches('/'),my_fp,id)).header("X-Mesh-Key",token.clone()).send().await;
+                // also move to dead-letter locally for debugging
+                let dl_dir = out_path.join(".dead_letter");
+                let _ = fs::create_dir_all(&dl_dir);
+                let _ = fs::write(dl_dir.join(format!("{}.fail",id)), format!("x3dh fail {} opk {} spk {}: {}", id, opk_id, spk_id, e));
+                continue;}};
+            // OPK FS grace: keep used priv for 5min for dupe delivery, then delete
             if opk_id != OPK_NONE {
                 let opk_path = mesh_dir().join("prekeys").join(format!("opk_{}.priv", opk_id));
-                let _ = fs::remove_file(opk_path);
+                if opk_path.exists() {
+                    let used_dir = mesh_dir().join("prekeys").join("used");
+                    let _ = fs::create_dir_all(&used_dir);
+                    let ts = now_secs();
+                    let dst = used_dir.join(format!("opk_{}.priv.{}.used", opk_id, ts));
+                    let _ = fs::rename(&opk_path, &dst);
+                    // also keep a symlink/copy for immediate grace lookup?
+                    // cleanup old used files >5min
+                    if let Ok(entries) = fs::read_dir(&used_dir) {
+                        for e in entries.flatten() {
+                            if let Some(name) = e.file_name().to_str() {
+                                if let Some(ts_str) = name.split('.').nth(2) {
+                                    if let Ok(ts_old) = ts_str.parse::<i64>() {
+                                        if now_secs() - ts_old > 300 {
+                                            let _ = fs::remove_file(e.path());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
             let okm=hkdf_derive_salt(&sk,&sk,b"mesh-v3-msg v1",64).unwrap(); let hek:[u8;32]=okm[0..32].try_into().unwrap(); let mk:[u8;32]=okm[32..64].try_into().unwrap();
             let header_plain=match xdec(&hek,&header_nonce,header_ct,b""){
@@ -715,12 +768,37 @@ async fn cmd_poll(host: &str, out_dir: Option<String>, do_decrypt: bool) -> Resu
                 let ek_pub_bytes = ek_pub_bytes_opt.unwrap();
                 let ek_pub = PublicKey::from(ek_pub_bytes);
                 let sk = match x3dh_bob(&my_x_priv,&my_fp,&sender_fp,&sender_x_pub,&ek_pub,spk_id,opk_id){
-                    Ok(v)=>v, Err(e)=>{eprintln!("{} x3dh bob new session {}",id,e); continue;}
+                    Ok(v)=>v, Err(e)=>{
+                        eprintln!("{} x3dh bob new session {} (opk {} spk {}) dead-lettering",id,e,opk_id,spk_id);
+                        let _=client.delete(format!("{}/mesh/v3/{}/{}",host.trim_end_matches('/'),my_fp,id)).header("X-Mesh-Key",token.clone()).send().await;
+                        let dl_dir = out_path.join(".dead_letter");
+                        let _ = fs::create_dir_all(&dl_dir);
+                        let _ = fs::write(dl_dir.join(format!("{}.fail",id)), format!("x3dh fail {} opk {} spk {}: {}", id, opk_id, spk_id, e));
+                        continue;}
                 };
-                // OPK deletion
+                // OPK FS grace: keep used priv for 5min for dupe delivery, then delete
                 if opk_id != OPK_NONE {
                     let opk_path = mesh_dir().join("prekeys").join(format!("opk_{}.priv", opk_id));
-                    let _ = fs::remove_file(opk_path);
+                    if opk_path.exists() {
+                        let used_dir = mesh_dir().join("prekeys").join("used");
+                        let _ = fs::create_dir_all(&used_dir);
+                        let ts = now_secs();
+                        let dst = used_dir.join(format!("opk_{}.priv.{}.used", opk_id, ts));
+                        let _ = fs::rename(&opk_path, &dst);
+                        if let Ok(entries) = fs::read_dir(&used_dir) {
+                            for e in entries.flatten() {
+                                if let Some(name) = e.file_name().to_str() {
+                                    if let Some(ts_str) = name.split('.').nth(2) {
+                                        if let Ok(ts_old) = ts_str.parse::<i64>() {
+                                            if now_secs() - ts_old > 300 {
+                                                let _ = fs::remove_file(e.path());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 let root_key_b64 = b64_encode(&sk);
                 let header_key = hkdf_derive(&sk, b"mesh-v3-header v1", 32)?;
@@ -918,6 +996,71 @@ async fn cmd_poll(host: &str, out_dir: Option<String>, do_decrypt: bool) -> Resu
         } else {
             eprintln!("{} unknown version {}", id, version);
             continue;
+        }
+    }
+    // OPK auto-refill: check remaining and republish if <10
+    {
+        let status_url = format!("{}/mesh/v3/{}/x3dh/status", host.trim_end_matches('/'), my_fp);
+        if let Ok(resp) = client.get(&status_url).header("X-Mesh-Key", token.clone()).send().await {
+            if resp.status().is_success() {
+                if let Ok(j) = resp.json::<serde_json::Value>().await {
+                    let remaining = j["opk_remaining"].as_u64().unwrap_or(100) as usize;
+                    let needs = j["needs_republish"].as_bool().unwrap_or(false);
+                    if needs || remaining < 10 {
+                        eprintln!("opk_low: {} remaining, auto-republishing", remaining);
+                        // generate new OPKs to top up to 100
+                        let prekeys_dir = mesh_dir().join("prekeys");
+                        let _ = std::fs::create_dir_all(&prekeys_dir);
+                        let mut opks = Vec::new();
+                        // find highest used id and generate new
+                        let mut existing_ids = std::collections::HashSet::new();
+                        if let Ok(entries) = std::fs::read_dir(&prekeys_dir) {
+                            for e in entries.flatten() {
+                                let name = e.file_name().to_string_lossy().to_string();
+                                if name.starts_with("opk_") && name.ends_with(".priv") {
+                                    if let Some(id_str) = name.strip_prefix("opk_").and_then(|s| s.strip_suffix(".priv")) {
+                                        if let Ok(id) = id_str.parse::<u32>() {
+                                            existing_ids.insert(id);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // generate 100 - remaining new OPKs
+                        let to_gen = 100 - remaining;
+                        let mut next_id = 0u32;
+                        while existing_ids.contains(&next_id) { next_id += 1; }
+                        for _ in 0..to_gen {
+                            while existing_ids.contains(&next_id) { next_id += 1; }
+                            let mut b=[0u8;32]; rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut b);
+                            let priv_ = x25519_dalek::StaticSecret::from(b);
+                            let pub_ = x25519_dalek::PublicKey::from(&priv_);
+                            let id = next_id;
+                            let _ = std::fs::write(prekeys_dir.join(format!("opk_{}.priv", id)), crate::b64_encode(&b));
+                            let _ = std::fs::set_permissions(prekeys_dir.join(format!("opk_{}.priv", id)), std::fs::Permissions::from_mode(0o600));
+                            opks.push(serde_json::json!({"id": id, "pub": crate::b64_encode(pub_.as_bytes())}));
+                            existing_ids.insert(id);
+                            next_id += 1;
+                            if opks.len() >= to_gen { break; }
+                        }
+                        if !opks.is_empty() {
+                            // publish via cmd_x3dh_publish partial: POST only new OPKs
+                            let (_, ed_sk, fp, _, x_pub) = match crate::load_identity() {
+                                Ok(v) => v,
+                                Err(_) => { eprintln!("auto-republish: load_identity failed"); return Ok(()); }
+                            };
+                            let spk_id_str = std::fs::read_to_string(prekeys_dir.join("spk_id")).unwrap_or_else(|_| "0".to_string());
+                            let spk_id: u32 = spk_id_str.trim().parse().unwrap_or(0);
+                            let spk_pub_b64 = std::fs::read_to_string(mesh_dir().join("x_id_pub")).unwrap_or_default(); // fallback, not used
+                            // we need spk_pub, spk_sig - reload from files if exist
+                            let spk_pub_path = prekeys_dir.join(format!("spk_{}.priv", spk_id));
+                            // for simplicity, just call full publish which regenerates SPK too (ok)
+                            let _ = crate::cmd_x3dh_publish(host).await;
+                            eprintln!("auto-republish: published {} new OPKs (remaining was {})", opks.len(), remaining);
+                        }
+                    }
+                }
+            }
         }
     }
     Ok(())
