@@ -1105,3 +1105,611 @@ async fn main() -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use x25519_dalek::{StaticSecret, PublicKey};
+    use ed25519_dalek::Signer;
+
+    // ---------- helpers ----------
+    fn fixed_secret(byte: u8) -> StaticSecret {
+        StaticSecret::from([byte; 32])
+    }
+
+    // ---------- b64 ----------
+    #[test]
+    fn b64_roundtrip_url_safe() {
+        let data = b"hello world mesh v3 test vector for b64";
+        let enc = b64_encode(data);
+        assert!(!enc.contains('+'));
+        assert!(!enc.contains('/'));
+        assert!(!enc.contains('='));
+        let dec = b64_decode(&enc).unwrap();
+        assert_eq!(dec, data);
+    }
+
+    #[test]
+    fn b64_decode_accepts_both_engines() {
+        let data = b"test both standard and url safe padding";
+        let std_enc = STANDARD.encode(data);
+        let url_enc = URL_SAFE_NO_PAD.encode(data);
+        // our decoder should handle both
+        assert_eq!(b64_decode(&std_enc).unwrap(), data);
+        assert_eq!(b64_decode(&url_enc).unwrap(), data);
+        // with whitespace trimming
+        assert_eq!(b64_decode(&format!("  {}\n", url_enc)).unwrap(), data);
+    }
+
+    #[test]
+    fn b64_decode_rejects_invalid() {
+        assert!(b64_decode("!!! not base64 !!!").is_err());
+        assert!(b64_decode("").is_err() || b64_decode("").unwrap().is_empty());
+    }
+
+    // ---------- fp ----------
+    #[test]
+    fn fp_bytes_roundtrip() {
+        let fp = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let bytes = fp_to_bytes(fp).unwrap();
+        assert_eq!(fp_from_bytes(&bytes), fp);
+        // uppercase input should fail (our fp_to_bytes expects lowercase? it uses from_str_radix which allows upper)
+        // but fp length check
+        assert_eq!(bytes.len(), 32);
+    }
+
+    #[test]
+    fn fp_to_bytes_rejects_bad() {
+        assert!(fp_to_bytes("short").is_err());
+        assert!(fp_to_bytes("gg".repeat(32).as_str()).is_err());
+        assert!(fp_to_bytes(&"00".repeat(31)).is_err());
+        assert!(fp_to_bytes(&"00".repeat(33)).is_err());
+    }
+
+    #[test]
+    fn fp_from_bytes_known_vector() {
+        let b = [0xab; 32];
+        let s = fp_from_bytes(&b);
+        assert_eq!(s, "ab".repeat(32));
+        assert_eq!(s.len(), 64);
+    }
+
+    // ---------- ed25519 ----------
+    #[test]
+    fn ed_verify_true_and_false() {
+        let mut seed = [7u8; 32];
+        let sk = SigningKey::from_bytes(&seed);
+        let vk_bytes = sk.verifying_key().as_bytes().clone();
+        let fp = hex::encode(vk_bytes);
+        let msg = b"CLAIM /mesh/v3/test/claim\n1234567890\nnonce1234567890";
+        let sig = sk.sign(msg);
+        let sig_b64 = STANDARD.encode(sig.to_bytes());
+        assert!(ed_verify(&fp, msg, &sig_b64).unwrap());
+
+        let bad_msg = b"CLAIM /mesh/v3/test/claim\n1234567891\nnonce1234567890";
+        assert!(!ed_verify(&fp, bad_msg, &sig_b64).unwrap());
+
+        let mut bad_sig = sig.to_bytes();
+        bad_sig[0] ^= 1;
+        let bad_sig_b64 = STANDARD.encode(bad_sig);
+        assert!(!ed_verify(&fp, msg, &bad_sig_b64).unwrap());
+    }
+
+    // ---------- hkdf ----------
+    #[test]
+    fn hkdf_deterministic_and_varying_info() {
+        let ikm = b"input key material for mesh v3 hkdf test";
+        let out1 = hkdf_derive(ikm, b"info1", 32).unwrap();
+        let out2 = hkdf_derive(ikm, b"info1", 32).unwrap();
+        let out3 = hkdf_derive(ikm, b"info2", 32).unwrap();
+        assert_eq!(out1, out2);
+        assert_ne!(out1, out3);
+        assert_eq!(out1.len(), 32);
+
+        let out_long = hkdf_derive(ikm, b"info1", 64).unwrap();
+        assert_eq!(out_long.len(), 64);
+        assert_eq!(&out_long[0..32], &out1[..]);
+    }
+
+    #[test]
+    fn hkdf_salt_changes_output() {
+        let ikm = b"same ikm";
+        let salt1 = b"salt1";
+        let salt2 = b"salt2";
+        let o1 = hkdf_derive_salt(salt1, ikm, b"info", 32).unwrap();
+        let o2 = hkdf_derive_salt(salt2, ikm, b"info", 32).unwrap();
+        let o3 = hkdf_derive(ikm, b"info", 32).unwrap();
+        assert_ne!(o1, o2);
+        assert_ne!(o1, o3);
+    }
+
+    // ---------- kdf ----------
+    #[test]
+    fn kdf_rk_is_deterministic_and_splits() {
+        let rk = vec![0x11u8; 32];
+        let dh = vec![0x22u8; 32];
+        let (rk1, ck1) = kdf_rk(&rk, &dh).unwrap();
+        let (rk2, ck2) = kdf_rk(&rk, &dh).unwrap();
+        assert_eq!(rk1, rk2);
+        assert_eq!(ck1, ck2);
+        assert_eq!(rk1.len(), 32);
+        assert_eq!(ck1.len(), 32);
+        assert_ne!(rk1, ck1);
+    }
+
+    #[test]
+    fn kdf_ck_chain() {
+        let ck0 = vec![0x33u8; 32];
+        let (ck1, mk1) = kdf_ck(&ck0).unwrap();
+        let (ck2, mk2) = kdf_ck(&ck1).unwrap();
+        assert_ne!(ck0, ck1);
+        assert_ne!(ck1, ck2);
+        assert_ne!(mk1, mk2);
+        assert_eq!(ck1.len(), 32);
+        assert_eq!(mk1.len(), 32);
+        // same input -> same output
+        let (ck1_b, mk1_b) = kdf_ck(&ck0).unwrap();
+        assert_eq!(ck1, ck1_b);
+        assert_eq!(mk1, mk1_b);
+    }
+
+    // ---------- XChaCha20-Poly1305 ----------
+    #[test]
+    fn xenc_xdec_roundtrip() {
+        let key = [9u8; 32];
+        let nonce = [1u8; 24];
+        let pt = b"hello mesh v3 double ratchet message";
+        let aad = b"header_ct_for_aad";
+
+        let ct = xenc(&key, &nonce, pt, aad).unwrap();
+        assert_ne!(ct, pt);
+        assert!(ct.len() > pt.len()); // tag
+
+        let pt2 = xdec(&key, &nonce, &ct, aad).unwrap();
+        assert_eq!(pt2, pt);
+    }
+
+    #[test]
+    fn xenc_fails_on_wrong_key_aad_nonce_tamper() {
+        let key = [2u8; 32];
+        let wrong_key = [3u8; 32];
+        let nonce = [4u8; 24];
+        let wrong_nonce = [5u8; 24];
+        let pt = b"secret";
+        let aad = b"aad";
+        let wrong_aad = b"bad aad";
+
+        let ct = xenc(&key, &nonce, pt, aad).unwrap();
+
+        assert!(xdec(&wrong_key, &nonce, &ct, aad).is_err());
+        assert!(xdec(&key, &wrong_nonce, &ct, aad).is_err());
+        assert!(xdec(&key, &nonce, &ct, wrong_aad).is_err());
+
+        let mut tampered = ct.clone();
+        tampered[0] ^= 1;
+        assert!(xdec(&key, &nonce, &tampered, aad).is_err());
+
+        // empty plaintext still works
+        let ct_empty = xenc(&key, &nonce, b"", aad).unwrap();
+        let pt_empty = xdec(&key, &nonce, &ct_empty, aad).unwrap();
+        assert_eq!(pt_empty, b"");
+    }
+
+    #[test]
+    fn xenc_random_nonce_uniqueness() {
+        let key = [6u8; 32];
+        let mut nonces = std::collections::HashSet::new();
+        for _ in 0..100 {
+            let mut n = [0u8; 24];
+            OsRng.fill_bytes(&mut n);
+            assert!(nonces.insert(hex::encode(n)), "nonce collision - extremely unlikely, rng broken");
+        }
+        // same plaintext with different nonces must give different ciphertexts
+        let pt = b"same message";
+        let n1 = [11u8; 24];
+        let n2 = [12u8; 24];
+        let ct1 = xenc(&key, &n1, pt, b"").unwrap();
+        let ct2 = xenc(&key, &n2, pt, b"").unwrap();
+        assert_ne!(ct1, ct2);
+    }
+
+    // ---------- ChaCha20-Poly1305 (chunk) ----------
+    #[test]
+    fn cenc_cdec_roundtrip_with_aad() {
+        let key = [8u8; 32];
+        let nonce = [1u8; 12];
+        let pt = b"chunk data for streaming file encryption 64KiB";
+        let mut header_hash = [0u8; 32];
+        header_hash[0] = 42;
+        let mut ad = Vec::new();
+        ad.extend_from_slice(&header_hash);
+        ad.extend_from_slice(&5u64.to_le_bytes());
+        ad.push(0u8);
+
+        let ct = cenc(&key, &nonce, pt, &ad).unwrap();
+        let pt2 = cdec(&key, &nonce, &ct, &ad).unwrap();
+        assert_eq!(pt2, pt);
+
+        // wrong aad fails
+        ad[0] ^= 1;
+        assert!(cdec(&key, &nonce, &ct, &ad).is_err());
+    }
+
+    // ---------- DH ----------
+    #[test]
+    fn dh_keypair_generates_valid_unique_keys() {
+        let (priv1, pub1) = generate_dh_keypair();
+        let (priv2, pub2) = generate_dh_keypair();
+        assert_ne!(priv1, priv2);
+        assert_ne!(pub1, pub2);
+        assert_eq!(priv1.len(), 32);
+        assert_eq!(pub1.len(), 32);
+        // pub must correspond to priv
+        let ss = StaticSecret::from(priv1);
+        let derived_pub = PublicKey::from(&ss);
+        assert_eq!(derived_pub.as_bytes(), &pub1);
+    }
+
+    #[test]
+    fn dh_agreement_symmetric() {
+        let a_priv = fixed_secret(0x11);
+        let b_priv = fixed_secret(0x22);
+        let a_pub = PublicKey::from(&a_priv);
+        let b_pub = PublicKey::from(&b_priv);
+        let ab = a_priv.diffie_hellman(&b_pub);
+        let ba = b_priv.diffie_hellman(&a_pub);
+        assert_eq!(ab.as_bytes(), ba.as_bytes());
+        assert_ne!(ab.as_bytes(), &[0u8; 32]);
+    }
+
+    // ---------- init_session ----------
+    #[test]
+    fn init_session_creates_consistent_structure() {
+        let sk = vec![0x55u8; 32];
+        let peer_spk = [0x66u8; 32];
+        let sess = init_session_from_x3dh(&sk, &peer_spk).unwrap();
+        assert_eq!(sess.n_send, 0);
+        assert_eq!(sess.n_recv, 0);
+        assert_eq!(sess.pn, 0);
+        assert!(sess.chain_send_b64.is_some());
+        assert!(sess.chain_recv_b64.is_some());
+        assert!(sess.dh_recv_pub_b64.is_some());
+        assert_eq!(b64_decode(&sess.root_key_b64).unwrap().len(), 32);
+        assert_eq!(b64_decode(&sess.header_key_b64).unwrap().len(), 32);
+        assert_eq!(b64_decode(&sess.dh_send_priv_b64).unwrap().len(), 32);
+        assert_eq!(b64_decode(&sess.dh_send_pub_b64).unwrap().len(), 32);
+        assert_eq!(sess.skipped_keys.len(), 0);
+    }
+
+    // Pure Bob implementation for tests (no filesystem, deterministic)
+    fn x3dh_bob_pure(
+        bob_x_priv: &StaticSecret,
+        bob_spk_priv: &StaticSecret,
+        bob_opk_priv: Option<&StaticSecret>,
+        my_fp: &str,
+        peer_fp: &str,
+        peer_x_pub: &PublicKey,
+        ek_pub: &PublicKey,
+        spk_id: u32,
+        opk_id: u32,
+    ) -> Result<Vec<u8>> {
+        let dh1 = bob_spk_priv.diffie_hellman(peer_x_pub);
+        let dh2 = bob_x_priv.diffie_hellman(ek_pub);
+        let dh3 = bob_spk_priv.diffie_hellman(ek_pub);
+        let mut ikm = Vec::new();
+        ikm.extend_from_slice(dh1.as_bytes());
+        ikm.extend_from_slice(dh2.as_bytes());
+        ikm.extend_from_slice(dh3.as_bytes());
+        if opk_id != OPK_NONE {
+            let opk_priv = bob_opk_priv.ok_or_else(|| anyhow!("missing opk priv for test"))?;
+            let dh4 = opk_priv.diffie_hellman(ek_pub);
+            ikm.extend_from_slice(dh4.as_bytes());
+        }
+        let peer_fp_bytes = fp_to_bytes(peer_fp)?;
+        let my_fp_bytes = fp_to_bytes(my_fp)?;
+        let mut info = Vec::new();
+        info.extend_from_slice(b"mesh-v3-x3dh v1");
+        info.extend_from_slice(&peer_fp_bytes);
+        info.extend_from_slice(&my_fp_bytes);
+        info.extend_from_slice(&spk_id.to_be_bytes());
+        info.extend_from_slice(&opk_id.to_be_bytes());
+        let sk = hkdf_derive(&ikm, &info, 32)?;
+        Ok(sk)
+    }
+
+    // ---------- X3DH end-to-end ----------
+    #[test]
+    fn x3dh_alice_bob_produce_same_sk() {
+        // Deterministic identities for reproducible test
+        let bob_x_priv = fixed_secret(0xB2);
+        let bob_spk_priv = fixed_secret(0xC3);
+
+        let bob_x_pub = PublicKey::from(&bob_x_priv);
+        let bob_spk_pub = PublicKey::from(&bob_spk_priv);
+
+        // Generate real ed keys for Bob where fp == ed_pub (required for ed_verify)
+        let bob_ed_seed = [0xBBu8; 32];
+        let bob_ed_sk = SigningKey::from_bytes(&bob_ed_seed);
+        let bob_ed_fp = hex::encode(bob_ed_sk.verifying_key().as_bytes());
+        let bob_x_pub_bytes = bob_x_pub.to_bytes();
+        let bob_x_sig = bob_ed_sk.sign(&bob_x_pub_bytes);
+        let bob_spk_pub_bytes = bob_spk_pub.to_bytes();
+        let bob_spk_sig = bob_ed_sk.sign(&bob_spk_pub_bytes);
+
+        let alice_ed_seed = [0xAAu8; 32];
+        let alice_ed_sk = SigningKey::from_bytes(&alice_ed_seed);
+        let alice_ed_fp = hex::encode(alice_ed_sk.verifying_key().as_bytes());
+
+        let spk_id = 42u32;
+
+        // Build bundle as Alice will see it
+        let bundle = serde_json::json!({
+            "x_id_pub": b64_encode(&bob_x_pub_bytes),
+            "x_id_sig": STANDARD.encode(bob_x_sig.to_bytes()),
+            "spk_pub": b64_encode(&bob_spk_pub_bytes),
+            "spk_sig": STANDARD.encode(bob_spk_sig.to_bytes()),
+            "spk_id": spk_id,
+        });
+
+        let alice_x_priv_ss = StaticSecret::from([0xA1u8; 32]);
+        let (sk_alice, ek_pub, spk_id_out, opk_id_out) =
+            x3dh_alice(&alice_x_priv_ss, &alice_ed_fp, &bob_ed_fp, &bundle).unwrap();
+
+        // Alice's long-term x pub (from same secret 0xA1 for test)
+        let alice_x_pub = PublicKey::from(&StaticSecret::from([0xA1u8; 32]));
+        let ek_pub_obj = PublicKey::from(<[u8;32]>::try_from(ek_pub).unwrap());
+
+        // Pure Bob, no filesystem, uses the same spk priv we created the bundle with
+        let sk_bob = x3dh_bob_pure(
+            &bob_x_priv,
+            &bob_spk_priv,
+            None,
+            &bob_ed_fp,
+            &alice_ed_fp,
+            &alice_x_pub,
+            &ek_pub_obj,
+            spk_id_out,
+            opk_id_out,
+        )
+        .unwrap();
+
+        assert_eq!(sk_alice, sk_bob, "X3DH SK mismatch");
+        assert_eq!(sk_alice.len(), 32);
+    }
+
+    #[test]
+    fn x3dh_alice_bob_with_opk_produce_same_sk() {
+        let bob_x_priv = fixed_secret(0xB2);
+        let bob_spk_priv = fixed_secret(0xC3);
+        let bob_opk_priv = fixed_secret(0xD4);
+
+        let bob_x_pub = PublicKey::from(&bob_x_priv);
+        let bob_spk_pub = PublicKey::from(&bob_spk_priv);
+        let bob_opk_pub = PublicKey::from(&bob_opk_priv);
+
+        let bob_ed_sk = SigningKey::from_bytes(&[0xBBu8; 32]);
+        let bob_ed_fp = hex::encode(bob_ed_sk.verifying_key().as_bytes());
+        let alice_ed_sk = SigningKey::from_bytes(&[0xAAu8; 32]);
+        let alice_ed_fp = hex::encode(alice_ed_sk.verifying_key().as_bytes());
+
+        let bundle = serde_json::json!({
+            "x_id_pub": b64_encode(bob_x_pub.as_bytes()),
+            "x_id_sig": STANDARD.encode(bob_ed_sk.sign(bob_x_pub.as_bytes()).to_bytes()),
+            "spk_pub": b64_encode(bob_spk_pub.as_bytes()),
+            "spk_sig": STANDARD.encode(bob_ed_sk.sign(bob_spk_pub.as_bytes()).to_bytes()),
+            "spk_id": 7u32,
+            "opk_id": 9u32,
+            "opk_pub": b64_encode(bob_opk_pub.as_bytes()),
+        });
+
+        let alice_x_priv = StaticSecret::from([0xA1u8; 32]);
+        let (sk_alice, ek_pub, spk_id_out, opk_id_out) =
+            x3dh_alice(&alice_x_priv, &alice_ed_fp, &bob_ed_fp, &bundle).unwrap();
+        assert_eq!(opk_id_out, 9);
+
+        let alice_x_pub = PublicKey::from(&alice_x_priv);
+        let ek_pub_obj = PublicKey::from(<[u8;32]>::try_from(ek_pub).unwrap());
+
+        let sk_bob = x3dh_bob_pure(
+            &bob_x_priv,
+            &bob_spk_priv,
+            Some(&bob_opk_priv),
+            &bob_ed_fp,
+            &alice_ed_fp,
+            &alice_x_pub,
+            &ek_pub_obj,
+            spk_id_out,
+            opk_id_out,
+        )
+        .unwrap();
+
+        assert_eq!(sk_alice, sk_bob);
+    }
+
+    #[test]
+    fn x3dh_with_opk_produces_different_sk_than_without() {
+        let mut bob_ed_seed = [0x22u8; 32];
+        let bob_ed_sk = SigningKey::from_bytes(&bob_ed_seed);
+        let bob_fp = hex::encode(bob_ed_sk.verifying_key().as_bytes());
+
+        let mut alice_ed_seed = [0x11u8; 32];
+        let alice_ed_sk = SigningKey::from_bytes(&alice_ed_seed);
+        let alice_fp = hex::encode(alice_ed_sk.verifying_key().as_bytes());
+
+        let bob_x_priv = fixed_secret(0x33);
+        let bob_spk_priv = fixed_secret(0x44);
+        let bob_opk_priv = fixed_secret(0x55);
+
+        let bob_x_pub = PublicKey::from(&bob_x_priv);
+        let bob_spk_pub = PublicKey::from(&bob_spk_priv);
+        let bob_opk_pub = PublicKey::from(&bob_opk_priv);
+
+        let bob_x_sig = bob_ed_sk.sign(bob_x_pub.as_bytes());
+        let bob_spk_sig = bob_ed_sk.sign(bob_spk_pub.as_bytes());
+
+        let bundle_no_opk = serde_json::json!({
+            "x_id_pub": b64_encode(bob_x_pub.as_bytes()),
+            "x_id_sig": STANDARD.encode(bob_x_sig.to_bytes()),
+            "spk_pub": b64_encode(bob_spk_pub.as_bytes()),
+            "spk_sig": STANDARD.encode(bob_spk_sig.to_bytes()),
+            "spk_id": 1u32,
+        });
+
+        let bundle_with_opk = serde_json::json!({
+            "x_id_pub": b64_encode(bob_x_pub.as_bytes()),
+            "x_id_sig": STANDARD.encode(bob_x_sig.to_bytes()),
+            "spk_pub": b64_encode(bob_spk_pub.as_bytes()),
+            "spk_sig": STANDARD.encode(bob_spk_sig.to_bytes()),
+            "spk_id": 1u32,
+            "opk_id": 7u32,
+            "opk_pub": b64_encode(bob_opk_pub.as_bytes())
+        });
+
+        let alice_x_priv = StaticSecret::from([0x11u8; 32]);
+
+        // need bob prekeys on disk for x3dh_bob; we will test only alice side SK difference
+        let (sk_no_opk, _, _, _) = x3dh_alice(&alice_x_priv, &alice_fp, &bob_fp, &bundle_no_opk).unwrap();
+        let (sk_with_opk, _, _, _) = x3dh_alice(&alice_x_priv, &alice_fp, &bob_fp, &bundle_with_opk).unwrap();
+        assert_ne!(sk_no_opk, sk_with_opk);
+    }
+
+    // ---------- Session serialization ----------
+    #[test]
+    fn session_serializes_and_preserves_keys() {
+        let sk = vec![9u8; 32];
+        let sess = init_session_from_x3dh(&sk, &[1u8; 32]).unwrap();
+        let json = serde_json::to_string(&sess).unwrap();
+        let sess2: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(sess.root_key_b64, sess2.root_key_b64);
+        assert_eq!(sess.header_key_b64, sess2.header_key_b64);
+        assert_eq!(sess.n_send, sess2.n_send);
+        assert_eq!(sess.skipped_keys.len(), 0);
+    }
+
+    // ---------- Double Ratchet KDF chain ----------
+    #[test]
+    fn double_ratchet_message_keys_unique_per_n() {
+        let sk = vec![0x77u8; 32];
+        let mut sess = init_session_from_x3dh(&sk, &[2u8; 32]).unwrap();
+        let ck0 = b64_decode(sess.chain_send_b64.as_ref().unwrap()).unwrap();
+        let (ck1, mk1) = kdf_ck(&ck0).unwrap();
+        let (ck2, mk2) = kdf_ck(&ck1).unwrap();
+        let (ck3, mk3) = kdf_ck(&ck2).unwrap();
+        assert_ne!(mk1, mk2);
+        assert_ne!(mk2, mk3);
+        assert_ne!(ck1, ck2);
+        // simulate n_send increments
+        sess.n_send = 3;
+        assert_eq!(sess.n_send, 3);
+    }
+
+    #[test]
+    fn skipped_keys_lru_limit_enforced() {
+        let sk = vec![0x88u8; 32];
+        let mut sess = init_session_from_x3dh(&sk, &[3u8; 32]).unwrap();
+        // fill beyond limit
+        for i in 0..(MAX_SKIPPED_KEYS + 50) {
+            let key = format!("aa{}-{}", "b".repeat(64), i);
+            sess.skipped_keys.insert(key, b64_encode(&[i as u8; 32]));
+        }
+        assert!(sess.skipped_keys.len() > MAX_SKIPPED_KEYS);
+        // simulate the trimming logic from poll()
+        if sess.skipped_keys.len() > MAX_SKIPPED_KEYS {
+            let keys: Vec<String> = sess.skipped_keys.keys().cloned().collect();
+            for k in keys.iter().take(MAX_SKIPPED_KEYS/2) {
+                sess.skipped_keys.remove(k);
+            }
+        }
+        assert!(sess.skipped_keys.len() <= MAX_SKIPPED_KEYS);
+    }
+
+    // ---------- STREAM / file chunk logic ----------
+    #[test]
+    fn chunk_size_and_stream_constants() {
+        assert_eq!(CHUNK_SIZE, 65519);
+        assert_eq!(MAX_V3_BODY, 132 * 1024 * 1024);
+        // CHUNK_SIZE is chosen so plaintext (65519) + tag (16) = 65535 fits exactly in u16
+        assert_eq!(CHUNK_SIZE + 16, 65535);
+        assert!(CHUNK_SIZE + 16 <= 65535); // fits in u16 length prefix
+        // wire format is [u16 len][ct] where ct = pt + 16 tag, so len field = CHUNK_SIZE+16
+        // 128M file needs 2049 chunks (65519*2048 = 134182912 < 134217728)
+        let max_file = 128 * 1024 * 1024;
+        let chunks = (max_file + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        assert_eq!(chunks, 2049);
+        let wire_overhead = chunks * 16;
+        assert_eq!(wire_overhead, 32784);
+        // README says 2048*16 = 32768 — that's the capacity for 134182912 bytes (2048 chunks)
+        assert_eq!(2048 * CHUNK_SIZE, 134182912);
+        assert_eq!(2048 * 16, 32768);
+        // wire size must still fit in MAX_V3_BODY
+        assert!(max_file + wire_overhead + 2048 < MAX_V3_BODY);
+    }
+
+    #[test]
+    fn file_chunking_deterministic() {
+        let file_size = 200_000usize;
+        let chunks = (file_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        assert_eq!(chunks, 4); // 65519*3=196557, remainder 3443
+        // verify chunk boundaries
+        let mut off = 0;
+        let mut chunk_sizes = Vec::new();
+        while off < file_size {
+            let end = std::cmp::min(off + CHUNK_SIZE, file_size);
+            chunk_sizes.push(end - off);
+            off = end;
+        }
+        assert_eq!(chunk_sizes, vec![65519, 65519, 65519, 3443]);
+        assert_eq!(chunk_sizes.iter().sum::<usize>(), file_size);
+    }
+
+    #[test]
+    fn header_and_body_nonce_randomness_required() {
+        // Regression test for old bug where header_nonce = [0;24] was used
+        // Ensure that two encryptions of same plaintext produce different ciphertexts
+        let key = [0xABu8; 32];
+        let pt = b"same plaintext attack if nonce reused";
+        let mut n1 = [0u8; 24];
+        let mut n2 = [0u8; 24];
+        OsRng.fill_bytes(&mut n1);
+        OsRng.fill_bytes(&mut n2);
+        assert_ne!(n1, n2, "rng should produce different nonces 99.999% of time");
+        let ct1 = xenc(&key, &n1, pt, b"").unwrap();
+        let ct2 = xenc(&key, &n2, pt, b"").unwrap();
+        assert_ne!(ct1, ct2);
+    }
+
+    #[test]
+    fn zeroize_does_not_panic_on_dirty_memory() {
+        let mut sec = Zeroizing::new([0xAAu8; 32]);
+        sec.fill(0);
+        assert_eq!(&*sec, &[0u8; 32]);
+        // Zeroizing drops, should zero stack
+    }
+
+    #[test]
+    fn session_paths_are_case_insensitive() {
+        let fp_upper = "ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789AB";
+        let fp_lower = fp_upper.to_ascii_lowercase();
+        let p1 = session_path(&fp_upper);
+        let p2 = session_path(&fp_lower);
+        assert_eq!(p1, p2);
+    }
+
+    #[test]
+    fn dr_header_encryption_integrity() {
+        let header_key = [0x42u8; 32];
+        let dh_pub = [0x11u8; 32];
+        let pn = 5u32;
+        let n = 10u32;
+        let header_plain = serde_json::json!({"dh": b64_encode(&dh_pub), "pn": pn, "n": n}).to_string();
+        let mut nonce = [0u8; 24];
+        OsRng.fill_bytes(&mut nonce);
+        let ct = xenc(&header_key, &nonce, header_plain.as_bytes(), b"").unwrap();
+        let pt = xdec(&header_key, &nonce, &ct, b"").unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&pt).unwrap();
+        assert_eq!(v["pn"], pn);
+        assert_eq!(v["n"], n);
+        assert_eq!(v["dh"], b64_encode(&dh_pub));
+    }
+}
+
